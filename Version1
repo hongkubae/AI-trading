@@ -20,6 +20,7 @@ import csv
 from sklearn.feature_selection import SelectKBest, f_classif
 import gym
 from stable_baselines3 import PPO
+from ta.trend import SMAIndicator, MACD  # 기존에 있던 SMAIndicator 임포트에 MACD를 추가
 
 # 로깅 설정
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s', filename='trading_bot.log', filemode='a')
@@ -271,18 +272,21 @@ def simple_strategy(data):
     short_ma = SMAIndicator(df['close'], window=10).sma_indicator().iloc[-1]
     long_ma = SMAIndicator(df['close'], window=50).sma_indicator().iloc[-1]
     rsi = RSIIndicator(df['close'], window=14).rsi().iloc[-1]
+    macd = MACD(df['close'], window_slow=26, window_fast=12, window_sign=9)
+    macd_value = macd.macd().iloc[-1]
+    macd_signal = macd.macd_signal().iloc[-1]
 
-    logging.debug(f"단기 MA: {short_ma}, 장기 MA: {long_ma}, RSI: {rsi}")
+    logging.debug(f"단기 MA: {short_ma}, 장기 MA: {long_ma}, RSI: {rsi}, MACD: {macd_value}, MACD 시그널: {macd_signal}")
 
     # RSI 값 동적 최적화
     buy_threshold = 45 + random.uniform(-5, 5)  # 동적으로 변경되는 매수 임계값
     sell_threshold = 55 + random.uniform(-5, 5)  # 동적으로 변경되는 매도 임계값
 
-    if short_ma > long_ma and rsi < buy_threshold:
+    if short_ma > long_ma and rsi < buy_threshold and macd_value > macd_signal:
         logging.info("매수 신호 발생!")
         return "buy"
-    elif short_ma < long_ma and rsi > sell_threshold:
-        logging.info("매도 신호 발생!")
+    elif short_ma < long_ma and rsi > sell_threshold and macd_value < macd_signal:
+        logging.info("매도 신호 발생! (숏 포지션)")
         return "sell"
     else:
         logging.info("신호 없음, 대기 중...")
@@ -379,7 +383,23 @@ def run_trading_bot(symbol):
         time.sleep(10)  # 기존 30초에서 10초로 변경
 
 # 포지션 열기 (재시도 로직 추가)
-def open_position(symbol, side, size, pos_side="long", price=None, retries=3, retry_delay=5):
+def open_position(symbol, side, pos_side=None, price=None, retries=3, retry_delay=5):
+    # 지갑 잔액 확인
+    balance = get_wallet_balance(symbol.split('-')[0])
+    if balance is None or balance <= 0:
+        logging.error("지갑 잔액이 부족하여 포지션을 열 수 없습니다.")
+        return
+
+    size = balance  # 지갑 잔액 최대치로 주문 사이즈 설정
+
+    if side == "buy":
+        pos_side = "long"
+    elif side == "sell":
+        pos_side = "short"
+
+    logging.info(f"포지션 열기 시도 - 심볼: {symbol}, 방향: {side}, 수량: {size}, 가격: {price}")
+    # 나머지 기존 로직은 그대로 유지
+
     logging.info(f"포지션 열기 시도 - 심볼: {symbol}, 방향: {side}, 수량: {size}, 가격: {price}")
     endpoint = "/api/v5/trade/order"
     url = BASE_URL + endpoint
@@ -425,7 +445,11 @@ def open_position(symbol, side, size, pos_side="long", price=None, retries=3, re
                 time.sleep(retry_delay)
 
 # 포지션 청산 (포지션 상태 확인 추가)
-def close_position(symbol, side, size, pos_side="long", price=None):
+def close_position(symbol, side, size, pos_side=None, price=None):
+    if side == "buy":
+        pos_side = "short"
+    elif side == "sell":
+        pos_side = "long"
     logging.info(f"포지션 청산 시도 - 심볼: {symbol}, 방향: {side}, 수량: {size}, 가격: {price}")
     position_status = check_position_status(symbol, pos_side)
     if position_status is None or position_status <= 0:
