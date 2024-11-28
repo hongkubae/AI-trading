@@ -7,12 +7,16 @@ import base64
 import requests
 import json
 import datetime
+from datetime import timezone
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import load_model
 import matplotlib.pyplot as plt
-from tensorflow.keras.optimizers import Adam
+from keras.optimizers import Adam
 import logging
 import os
+from flask import Flask, request, jsonify
+import threading
+import csv
 
 # 환경 변수 설정
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
@@ -26,8 +30,13 @@ API_SECRET = '80535AE66048DA42B7C65302B1A1AEC8'
 PASSPHRASE = 'Rjsgml2153!'
 BASE_URL = "https://www.okx.com"
 
-# API와 연결하기 위한 시그니처 생성
+# Flask 애플리케이션 설정
+app = Flask(__name__)
 
+# 웹훅 시그널 수신 상태를 저장하는 딕셔너리 (쓰레드 간 공유)
+webhook_signal = {'ENTER_LONG': False, 'ENTER_SHORT': False}
+
+# API와 연결하기 위한 시그니처 생성
 def generate_signature(timestamp, method, request_path, body=''):
     message = f"{timestamp}{method}{request_path}{body}"
     hmac_key = base64.b64decode(API_SECRET)
@@ -35,9 +44,8 @@ def generate_signature(timestamp, method, request_path, body=''):
     return base64.b64encode(signature.digest())
 
 # API 호출을 위한 헤더 생성
-
 def get_headers(method, request_path, body=''):
-    timestamp = datetime.datetime.utcnow().isoformat() + 'Z'
+    timestamp = datetime.datetime.now(timezone.utc).isoformat()
     signature = generate_signature(timestamp, method, request_path, body)
 
     headers = {
@@ -50,25 +58,33 @@ def get_headers(method, request_path, body=''):
     return headers
 
 # API 호출 함수
-
-def call_api(method, endpoint, params=None):
+def call_api(method, endpoint, params=None, body=None):
     url = f"{BASE_URL}{endpoint}"
-    headers = get_headers(method, endpoint)
-    response = requests.request(method, url, headers=headers, params=params)
+    headers = get_headers(method, endpoint, body)
+    response = requests.request(method, url, headers=headers, params=params, data=body)
     if response.status_code == 200:
-        return response.json()['data']
+        return response.json().get('data', None)
     else:
         logging.error(f"API Error: {response.status_code}, {response.text}")
         return None
 
-# 과거 데이터를 가져와 전처리하고 학습 데이터로 변환
+# 최신 가격 가져오기
+def get_latest_price(inst_id):
+    endpoint = f"/api/v5/market/ticker?instId={inst_id}"
+    response = call_api('GET', endpoint)
+    if response:
+        latest_price = response[0]['last']
+        return float(latest_price)
+    else:
+        logging.error(f"Failed to fetch latest price for {inst_id}")
+        return None
 
+# 과거 데이터를 가져와 전처리하고 학습 데이터로 변환
 def get_historical_data(inst_id, bar='1H', limit=100):
     endpoint = f"/api/v5/market/candles?instId={inst_id}&bar={bar}&limit={limit}"
     return call_api('GET', endpoint)
 
 # 데이터를 전처리하여 학습에 사용할 수 있는 형태로 변환
-
 def preprocess_data(data):
     df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'quote_volume', 'confirmations', 'trade_count'])
     df['timestamp'] = pd.to_datetime(df['timestamp'].astype(float), unit='ms')
@@ -77,7 +93,6 @@ def preprocess_data(data):
     return df
 
 # 데이터에 기술적 지표를 추가하여 특성 강화
-
 def calculate_technical_indicators(df):
     # RSI 계산
     delta = df['close'].diff(1)
@@ -107,14 +122,12 @@ def calculate_technical_indicators(df):
     return df
 
 # 데이터를 스케일링하여 학습에 적합한 형태로 변환
-
 def scale_data(df):
     scaler = MinMaxScaler(feature_range=(0, 1))
     scaled_data = scaler.fit_transform(df[['close', 'volume', 'RSI', 'MACD', 'Signal', 'Stochastic', 'BB_Middle', 'BB_Upper', 'BB_Lower']].values)
     return scaled_data, scaler
 
 # 시계열 데이터를 LSTM 모델의 입력 형태로 변환
-
 def create_dataset(scaled_data, look_back=60):
     X, y = [], []
     for i in range(look_back, len(scaled_data)):
@@ -123,57 +136,56 @@ def create_dataset(scaled_data, look_back=60):
     X, y = np.array(X), np.array(y)
     return X, y
 
-# 실시간 예측 및 거래 수행
-def predict_and_trade(inst_id, model_path='trained_lstm_model_with_rl.h5', look_back=60):
-    # 모델 불러오기
+# 예측 결과를 CSV 파일에 저장
+def save_prediction_to_csv(predicted_price, latest_price, filename='predictions.csv'):
+    fieldnames = ['timestamp', 'predicted_price', 'latest_price']
+    timestamp = datetime.datetime.now(timezone.utc).isoformat()
+    row = {'timestamp': timestamp, 'predicted_price': predicted_price, 'latest_price': latest_price}
+
+    file_exists = os.path.isfile(filename)
+    with open(filename, mode='a', newline='') as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row)
+
+# 실시간 예측 수행 (거래 수행은 제외)
+def predict_only(inst_id, model_path='trained_lstm_model_with_rl.h5', look_back=60):
+    # 모델 불러오기 및 컴파일
     model = load_model(model_path)
-    # 모델을 다시 컴파일하여 경고 제거
     model.compile(optimizer=Adam(learning_rate=0.001), loss='mean_squared_error')
-    
-    # 과거 데이터 가져오기
-    data = get_historical_data(inst_id, bar='1H', limit=200)
-    if data:
-        df = preprocess_data(data)
-        df = calculate_technical_indicators(df)
-        df.dropna(inplace=True)
 
-        # 데이터 스케일링 및 예측 수행
-        _, scaler = scale_data(df)
-        scaled_data = scaler.transform(df[['close', 'volume', 'RSI', 'MACD', 'Signal', 'Stochastic', 'BB_Middle', 'BB_Upper', 'BB_Lower']].values)
-        X, _ = create_dataset(scaled_data, look_back)
+    while True:
+        # 실시간 데이터를 계속 업데이트
+        data = get_historical_data(inst_id, bar='1H', limit=200)
+        if data:
+            df = preprocess_data(data)
+            df = calculate_technical_indicators(df)
+            df.dropna(inplace=True)
 
-        # 예측 수행
-        predicted_price = model.predict(X[-1].reshape(1, look_back, X.shape[2]))
-        predicted_price = scaler.inverse_transform(np.concatenate((predicted_price, np.zeros((predicted_price.shape[0], scaled_data.shape[1] - 1))), axis=1))[:, 0][0]
-        real_price = df['close'].values[-1]
+            _, scaler = scale_data(df)
+            scaled_data = scaler.transform(df[['close', 'volume', 'RSI', 'MACD', 'Signal', 'Stochastic', 'BB_Middle', 'BB_Upper', 'BB_Lower']].values)
+            X, _ = create_dataset(scaled_data, look_back)
 
-        # 거래 판단
-        if predicted_price > real_price:
-            # 매수 주문
-            place_order(inst_id, 'cross', 'buy', 'market', '1', 'long')
-            logging.info(f"Buy order placed for {inst_id} at predicted price: {predicted_price}")
-        elif predicted_price < real_price:
-            # 매도 주문
-            place_order(inst_id, 'cross', 'sell', 'market', '1', 'long')
-            logging.info(f"Sell order placed for {inst_id} at predicted price: {predicted_price}")
+            predicted_price = model.predict(X[-1].reshape(1, look_back, X.shape[2]))
+            predicted_price = scaler.inverse_transform(np.concatenate((predicted_price, np.zeros((predicted_price.shape[0], scaled_data.shape[1] - 1))), axis=1))[:, 0][0]
+            latest_price = get_latest_price(inst_id)
 
-# 주문 실행 함수
-def place_order(inst_id, td_mode, side, ord_type, sz, pos_side):
-    request_path = '/api/v5/trade/order'
-    body = json.dumps({
-        "instId": inst_id,
-        "tdMode": td_mode,
-        "side": side,
-        "ordType": ord_type,
-        "sz": sz,
-        "posSide": pos_side
-    })
-    response = call_api('POST', request_path, body=body)
-    if response:
-        logging.info(f"Order response: {response}")
-    else:
-        logging.error(f"Failed to place order for {inst_id}")
+            if latest_price is not None:
+                # 예측 결과와 최신 가격 출력 및 저장
+                logging.info(f"Predicted price: {predicted_price}, Latest price: {latest_price}")
+                print(f"Predicted price: {predicted_price}, Latest price: {latest_price}")
+                save_prediction_to_csv(predicted_price, latest_price)
 
+        # 실시간으로 데이터를 5분마다 가져와 예측
+        time.sleep(300)
+
+# Flask 서버와 예측 함수의 동시 실행
 if __name__ == '__main__':
-    # 실시간 거래 수행
-    predict_and_trade(inst_id='BTC-USDT-SWAP')
+    # 웹훅 서버 실행
+    webhook_thread = threading.Thread(target=lambda: app.run(port=5000))
+    webhook_thread.start()
+
+    # 실시간 예측 실행 (거래 수행은 하지 않음)
+    predict_thread = threading.Thread(target=predict_only, args=('BTC-USDT-SWAP',))
+    predict_thread.start()
