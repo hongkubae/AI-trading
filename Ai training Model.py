@@ -18,7 +18,6 @@ from flask import Flask, request, jsonify
 import threading
 import csv
 
-
 from tensorflow.keras.layers import LSTM, Dropout, Dense
 from tensorflow.keras.models import Sequential
 
@@ -141,10 +140,10 @@ def create_dataset(scaled_data, look_back=60):
     return X, y
 
 # 예측 결과를 CSV 파일에 저장
-def save_prediction_to_csv(predicted_price, latest_price, filename='predictions.csv'):
-    fieldnames = ['timestamp', 'predicted_price', 'latest_price']
-    timestamp = datetime.datetime.now(timezone.utc).isoformat()
-    row = {'timestamp': timestamp, 'predicted_price': predicted_price, 'latest_price': latest_price}
+def save_prediction_to_csv(predicted_price, latest_price, hour, filename='predictions.csv'):
+    fieldnames = ['hour', 'predicted_price', 'latest_price', 'error']
+    error = abs(predicted_price - latest_price)
+    row = {'hour': hour, 'predicted_price': predicted_price, 'latest_price': latest_price, 'error': error}
 
     file_exists = os.path.isfile(filename)
     with open(filename, mode='a', newline='') as file:
@@ -164,9 +163,8 @@ def create_lstm_model(learning_rate=0.001, neurons=50, dropout_rate=0.2):
     model.compile(optimizer=Adam(learning_rate=learning_rate), loss='mean_squared_error')
     return model
 
-# 모델 재훈련 함수
-
-def retrain_model(inst_id, model_path='trained_lstm_model_with_rl.h5', look_back=60):
+# 모델 재훈련 함수 (오차 반영)
+def retrain_model_with_error(inst_id, model_path='trained_lstm_model_with_rl.h5', look_back=60):
     # 과거 데이터 가져오기 및 전처리
     data = get_historical_data(inst_id, bar='1H', limit=1000)
     if data:
@@ -178,20 +176,19 @@ def retrain_model(inst_id, model_path='trained_lstm_model_with_rl.h5', look_back
         scaled_data, scaler = scale_data(df)
         X, y = create_dataset(scaled_data, look_back)
 
+        # 오차 데이터를 사용하여 가중치 적용
+        if os.path.exists('predictions.csv'):
+            df_errors = pd.read_csv('predictions.csv')
+            if not df_errors.empty:
+                avg_error = df_errors['error'].mean()
+                y = y * (1 - avg_error)  # 오차를 반영하여 y값을 조정
+
         # 모델 불러오기 및 재훈련
         model = create_lstm_model()
         model.fit(X, y, epochs=5, batch_size=32, verbose=1)
 
         # 재훈련된 모델 저장
         model.save(model_path)
-        logging.info("Model retrained and saved.")
-        print("Model retrained and saved.")
-
-        # 모델 재훈련
-        tuned_model.fit(X, y, epochs=5, batch_size=32, verbose=1)
-
-        # 재훈련된 모델 저장
-        tuned_model.model.save(model_path)
         logging.info("Model retrained and saved.")
         print("Model retrained and saved.")
 
@@ -203,6 +200,7 @@ def predict_only(inst_id, model_path='trained_lstm_model_with_rl.h5', look_back=
 
     last_retrain_time = time.time()  # 마지막 재훈련 시간
     retrain_interval = 24 * 60 * 60  # 하루 (초 단위)
+    current_hour = datetime.datetime.now().hour
 
     while True:
         # 실시간 데이터를 계속 업데이트
@@ -224,13 +222,16 @@ def predict_only(inst_id, model_path='trained_lstm_model_with_rl.h5', look_back=
                 # 예측 결과와 최신 가격 출력 및 저장
                 logging.info(f"Predicted price: {predicted_price}, Latest price: {latest_price}")
                 print(f"Predicted price: {predicted_price}, Latest price: {latest_price}")
-                save_prediction_to_csv(predicted_price, latest_price)
+                save_prediction_to_csv(predicted_price, latest_price, current_hour)
 
         # 하루에 한 번 모델 재훈련
         current_time = time.time()
         if current_time - last_retrain_time >= retrain_interval:
-            retrain_model(inst_id, model_path, look_back)
+            retrain_model_with_error(inst_id, model_path, look_back)
             last_retrain_time = current_time  # 마지막 재훈련 시간 갱신
+
+        # 1시간마다 x축의 다음 시간으로 이동
+        current_hour = (current_hour + 1) % 24
 
         # 실시간으로 데이터를 1분마다 가져와 예측
         time.sleep(60)
