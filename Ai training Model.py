@@ -18,6 +18,10 @@ from flask import Flask, request, jsonify
 import threading
 import csv
 
+
+from tensorflow.keras.layers import LSTM, Dropout, Dense
+from tensorflow.keras.models import Sequential
+
 # 환경 변수 설정
 os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
 
@@ -149,11 +153,56 @@ def save_prediction_to_csv(predicted_price, latest_price, filename='predictions.
             writer.writeheader()
         writer.writerow(row)
 
+# LSTM 모델 생성 함수
+def create_lstm_model(learning_rate=0.001, neurons=50, dropout_rate=0.2):
+    model = Sequential()
+    model.add(LSTM(neurons, return_sequences=True, input_shape=(60, 9)))
+    model.add(Dropout(dropout_rate))
+    model.add(LSTM(neurons))
+    model.add(Dropout(dropout_rate))
+    model.add(Dense(1))
+    model.compile(optimizer=Adam(learning_rate=learning_rate), loss='mean_squared_error')
+    return model
+
+# 모델 재훈련 함수
+
+def retrain_model(inst_id, model_path='trained_lstm_model_with_rl.h5', look_back=60):
+    # 과거 데이터 가져오기 및 전처리
+    data = get_historical_data(inst_id, bar='1H', limit=1000)
+    if data:
+        df = preprocess_data(data)
+        df = calculate_technical_indicators(df)
+        df.dropna(inplace=True)
+
+        # 데이터 스케일링 및 학습 데이터셋 생성
+        scaled_data, scaler = scale_data(df)
+        X, y = create_dataset(scaled_data, look_back)
+
+        # 모델 불러오기 및 재훈련
+        model = create_lstm_model()
+        model.fit(X, y, epochs=5, batch_size=32, verbose=1)
+
+        # 재훈련된 모델 저장
+        model.save(model_path)
+        logging.info("Model retrained and saved.")
+        print("Model retrained and saved.")
+
+        # 모델 재훈련
+        tuned_model.fit(X, y, epochs=5, batch_size=32, verbose=1)
+
+        # 재훈련된 모델 저장
+        tuned_model.model.save(model_path)
+        logging.info("Model retrained and saved.")
+        print("Model retrained and saved.")
+
 # 실시간 예측 수행 (거래 수행은 제외)
 def predict_only(inst_id, model_path='trained_lstm_model_with_rl.h5', look_back=60):
     # 모델 불러오기 및 컴파일
     model = load_model(model_path)
     model.compile(optimizer=Adam(learning_rate=0.001), loss='mean_squared_error')
+
+    last_retrain_time = time.time()  # 마지막 재훈련 시간
+    retrain_interval = 24 * 60 * 60  # 하루 (초 단위)
 
     while True:
         # 실시간 데이터를 계속 업데이트
@@ -177,13 +226,20 @@ def predict_only(inst_id, model_path='trained_lstm_model_with_rl.h5', look_back=
                 print(f"Predicted price: {predicted_price}, Latest price: {latest_price}")
                 save_prediction_to_csv(predicted_price, latest_price)
 
-        # 실시간으로 데이터를 5분마다 가져와 예측
-        time.sleep(300)
+        # 하루에 한 번 모델 재훈련
+        current_time = time.time()
+        if current_time - last_retrain_time >= retrain_interval:
+            retrain_model(inst_id, model_path, look_back)
+            last_retrain_time = current_time  # 마지막 재훈련 시간 갱신
+
+        # 실시간으로 데이터를 1분마다 가져와 예측
+        time.sleep(60)
 
 # Flask 서버와 예측 함수의 동시 실행
 if __name__ == '__main__':
-    # 웹훅 서버 실행
-    webhook_thread = threading.Thread(target=lambda: app.run(port=5000))
+    # 웹훅 서버 실행 (비차단 모드로 실행)
+    webhook_thread = threading.Thread(target=lambda: app.run(port=5000, debug=False, use_reloader=False))
+    webhook_thread.daemon = True  # 메인 스레드가 종료되면 이 스레드도 종료되도록 설정
     webhook_thread.start()
 
     # 실시간 예측 실행 (거래 수행은 하지 않음)
