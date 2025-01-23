@@ -6,10 +6,11 @@ import os
 
 OKX_ENDPOINT = "https://www.okx.com"
 
-def fetch_okx_5min_after(inst_id="ETH-USDT", after_ts=None, limit=200):
+def fetch_okx_5min_latest(inst_id="ETH-USDT", limit=200):
     """
-    OKX 5분봉을 after_ts(밀리초) 이후로 최대 limit개 요청.
-    반환: DataFrame(['ts','open','high','low','close','volume'])
+    OKX에서 5분봉 '최신 limit개'를 받아온다.
+    - 가장 최근 봉부터 ~ 과거 순서로 data가 온다고 가정.
+    - 반환: DF(['ts','open','high','low','close','volume'])
     """
     url = f"{OKX_ENDPOINT}/api/v5/market/candles"
     params = {
@@ -17,16 +18,12 @@ def fetch_okx_5min_after(inst_id="ETH-USDT", after_ts=None, limit=200):
         "bar": "5m",
         "limit": limit
     }
-    if after_ts is not None:
-        # 마지막 ts 이후 봉만 받기 위해 after=last_ts+1
-        params["after"] = str(after_ts + 1)
-
     r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
     data_json = r.json()
 
     if "data" not in data_json:
-        print("[fetch_okx_5min_after] No 'data' field in response.")
+        print("[fetch_okx_5min_latest] 'data' not in response.")
         return pd.DataFrame()
 
     records = data_json["data"]
@@ -34,8 +31,9 @@ def fetch_okx_5min_after(inst_id="ETH-USDT", after_ts=None, limit=200):
         return pd.DataFrame()
 
     all_rows = []
+    # OKX는 [최근 -> 과거] 순으로 줄 때가 많으므로
     for row in records:
-        # row: [timestamp(ms), open, high, low, close, volume, ...]
+        # row: [ts(ms), open, high, low, close, volume, ...]
         all_rows.append({
             "ts": int(row[0]),
             "open": float(row[1]),
@@ -45,37 +43,33 @@ def fetch_okx_5min_after(inst_id="ETH-USDT", after_ts=None, limit=200):
             "volume": float(row[5])
         })
     df = pd.DataFrame(all_rows)
-    df.sort_values(by="ts", inplace=True)  # 과거->최근
+    # 과거 -> 최근순 정렬
+    df.sort_values(by="ts", inplace=True)
     df.reset_index(drop=True, inplace=True)
     return df
 
 def update_historical_csv(inst_id="ETH-USDT", csv_path="data/historical_data.csv"):
     """
-    - 기존 CSV 불러옴
-    - 마지막 ts 찾기
-    - after=last_ts로 OKX 5분봉 받아 옴
-    - 기존 + 새 데이터 병합 -> 중복 제거 -> 정렬 -> 저장
-    => 5분마다 실행 시, CSV가 점차 커짐
+    1) 기존 CSV 로드
+    2) OKX에서 '최신 200봉'을 받아옴(fetch_okx_5min_latest)
+    3) 기존 + 새 데이터 병합 -> 중복 제거 -> 정렬 -> 저장
+    => 5분마다 호출하면, 새 봉이 생길 때마다 CSV rows 증가
     """
     os.makedirs(os.path.dirname(csv_path), exist_ok=True)
 
     if os.path.isfile(csv_path):
         df_existing = pd.read_csv(csv_path)
-        if df_existing.empty:
-            last_ts = None
-        else:
-            last_ts = df_existing["ts"].max()
     else:
         df_existing = pd.DataFrame(columns=["ts","open","high","low","close","volume"])
-        last_ts = None
 
-    new_df = fetch_okx_5min_after(inst_id=inst_id, after_ts=last_ts, limit=200)
+    # 최신 200봉 가져오기
+    new_df = fetch_okx_5min_latest(inst_id=inst_id, limit=200)
     if new_df.empty:
-        print("[update_historical_csv] No new data or empty fetch.")
+        print("[update_historical_csv] No new data fetched (empty).")
         return
 
     combined = pd.concat([df_existing, new_df], ignore_index=True)
-    combined.drop_duplicates(subset=["ts"], inplace=True)
+    combined.drop_duplicates(subset=["ts"], keep="last", inplace=True)
     combined.sort_values(by="ts", inplace=True)
     combined.reset_index(drop=True, inplace=True)
 
